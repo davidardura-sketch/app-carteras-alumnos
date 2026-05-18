@@ -672,9 +672,33 @@ def calculate_backtest(navs: pd.DataFrame, final_weights: dict[str, float]) -> d
     drawdown = liquidativo / rolling_max - 1
     max_drawdown = drawdown.min()
 
+    # Métricas individuales de los fondos seleccionados en el mismo periodo analizado.
+    fund_metrics_rows = []
+    fund_weights = dict(zip(valid_cols, weights * 100))
+    fund_navs = pd.DataFrame(index=returns.index)
+    for col in valid_cols:
+        fund_returns = returns[col].dropna()
+        if fund_returns.empty:
+            continue
+        fund_nav = INITIAL_NAV * (1 + fund_returns).cumprod()
+        fund_navs[col] = fund_nav
+        fund_total_return = fund_nav.iloc[-1] / fund_nav.iloc[0] - 1
+        fund_years = len(fund_returns) / MONTHS_PER_YEAR
+        fund_annual_return = (1 + fund_total_return) ** (1 / fund_years) - 1 if fund_years > 0 else np.nan
+        fund_annual_volatility = fund_returns.std() * np.sqrt(MONTHS_PER_YEAR)
+        fund_metrics_rows.append({
+            "Identificador": col,
+            "Peso final": fund_weights.get(col, np.nan),
+            "Rentabilidad acumulada": fund_total_return,
+            "Rentabilidad anualizada": fund_annual_return,
+            "Volatilidad anualizada": fund_annual_volatility,
+        })
+
+    fund_metrics = pd.DataFrame(fund_metrics_rows)
+
     return {
         "selected_assets": valid_cols,
-        "weights": dict(zip(valid_cols, weights * 100)),
+        "weights": fund_weights,
         "portfolio_returns": portfolio_returns,
         "liquidativo": liquidativo,
         "total_return": total_return,
@@ -683,6 +707,8 @@ def calculate_backtest(navs: pd.DataFrame, final_weights: dict[str, float]) -> d
         "sharpe": sharpe,
         "drawdown": drawdown,
         "max_drawdown": max_drawdown,
+        "fund_metrics": fund_metrics,
+        "fund_navs": fund_navs,
     }
 
 
@@ -696,6 +722,58 @@ def format_num(x: float) -> str:
     if pd.isna(x):
         return "n.d."
     return f"{x:.2f}"
+
+
+def prepare_fund_metrics_table(result: dict, portfolio_detail: pd.DataFrame) -> pd.DataFrame:
+    """Une métricas individuales calculadas con los nombres y categorías de la cartera."""
+    fund_metrics = result.get("fund_metrics")
+    if fund_metrics is None or fund_metrics.empty:
+        return pd.DataFrame()
+
+    metrics = fund_metrics.copy()
+    if portfolio_detail is None or portfolio_detail.empty:
+        return metrics
+
+    cols = [
+        "Identificador",
+        "Nombre",
+        "Bloque",
+        "Categoría",
+        "Subcategoría",
+        "Peso final",
+    ]
+    available_cols = [c for c in cols if c in portfolio_detail.columns]
+    info = portfolio_detail[available_cols].copy()
+    info["Identificador"] = info["Identificador"].astype(str)
+    metrics["Identificador"] = metrics["Identificador"].astype(str)
+
+    # Si existe Peso final en ambas fuentes, priorizamos el peso de la cartera visual.
+    metrics = metrics.drop(columns=["Peso final"], errors="ignore")
+    merged = metrics.merge(info, on="Identificador", how="left")
+
+    ordered_cols = [
+        "Identificador",
+        "Nombre",
+        "Bloque",
+        "Categoría",
+        "Subcategoría",
+        "Peso final",
+        "Rentabilidad acumulada",
+        "Rentabilidad anualizada",
+        "Volatilidad anualizada",
+    ]
+    ordered_cols = [c for c in ordered_cols if c in merged.columns]
+    return merged[ordered_cols].sort_values("Peso final", ascending=False) if "Peso final" in merged.columns else merged[ordered_cols]
+
+
+def format_fund_metrics_for_display(fund_metrics: pd.DataFrame) -> pd.DataFrame:
+    display = fund_metrics.copy()
+    if "Peso final" in display.columns:
+        display["Peso final"] = pd.to_numeric(display["Peso final"], errors="coerce").map(lambda x: f"{x:.2f}%" if pd.notna(x) else "")
+    for col in ["Rentabilidad acumulada", "Rentabilidad anualizada", "Volatilidad anualizada"]:
+        if col in display.columns:
+            display[col] = pd.to_numeric(display[col], errors="coerce").map(lambda x: f"{x:.2%}" if pd.notna(x) else "")
+    return display
 
 
 # ------------------------------------------------------------
@@ -815,6 +893,9 @@ def create_one_pager_excel(result: dict, final_weights_df: pd.DataFrame, profile
         # Hojas auxiliares
         metrics_df.to_excel(writer, sheet_name="Métricas", index=False)
         final_weights_df.to_excel(writer, sheet_name="Composición", index=False)
+        fund_metrics_df = prepare_fund_metrics_table(result, final_weights_df)
+        if not fund_metrics_df.empty:
+            fund_metrics_df.to_excel(writer, sheet_name="Métricas fondos", index=False)
         liquidativo_df.to_excel(writer, sheet_name="Liquidativo", index=False)
         drawdown_df.to_excel(writer, sheet_name="Drawdown", index=False)
 
@@ -969,6 +1050,32 @@ def create_portfolio_pdf_report(selected_row: pd.Series, portfolio_detail: pd.Da
     story.append(Paragraph("Drawdown", section_style))
     dd = result["drawdown"]
     story.append(make_line_chart(dd, "Drawdown de la cartera", y_min=min(float(dd.min()) * 1.15, -0.01), y_max=0.01, is_pct=True))
+    fund_metrics_table_df = prepare_fund_metrics_table(result, portfolio_detail)
+    if not fund_metrics_table_df.empty:
+        story.append(Paragraph("Comportamiento de los fondos en el periodo analizado", section_style))
+        story.append(Paragraph("Las métricas se calculan sobre el mismo periodo oculto usado para el backtest de la cartera.", small_style))
+        fm_rows = [["Fondo", "Peso", "Rent. acum.", "Rent. anual.", "Vol. anual."]]
+        for _, r in fund_metrics_table_df.iterrows():
+            fm_rows.append([
+                Paragraph(str(r.get("Nombre", r.get("Identificador", "")))[:90], small_style),
+                f"{float(r.get('Peso final', 0.0)):.2f}%" if pd.notna(r.get("Peso final", np.nan)) else "",
+                _pct(r.get("Rentabilidad acumulada", np.nan)),
+                _pct(r.get("Rentabilidad anualizada", np.nan)),
+                _pct(r.get("Volatilidad anualizada", np.nan)),
+            ])
+        fm_table = Table(fm_rows, colWidths=[7.2 * cm, 2.0 * cm, 2.4 * cm, 2.4 * cm, 2.4 * cm], repeatRows=1)
+        fm_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0B1F3A")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#CBD5E1")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F8FAFC")]),
+            ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.3),
+        ]))
+        story.append(fm_table)
+
     story.append(PageBreak())
 
     story.append(Paragraph("Cartera completa", section_style))
@@ -1664,13 +1771,46 @@ def student_page(username: str, user_info: dict):
         )
         st.plotly_chart(fig_dd, use_container_width=True)
 
-        one_pager = create_one_pager_excel(result, final_weights_df, profile)
-        st.download_button(
-            "Descargar one pager: Informe de cartera",
-            data=one_pager,
-            file_name="informe_de_cartera.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        st.subheader("Comportamiento de los fondos seleccionados")
+        st.caption("Métricas calculadas para cada fondo en el mismo periodo oculto del backtest. No se muestran fechas reales.")
+        fund_metrics_display = prepare_fund_metrics_table(result, final_weights_df)
+        if not fund_metrics_display.empty:
+            st.dataframe(
+                format_fund_metrics_for_display(fund_metrics_display),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No hay métricas individuales disponibles para los fondos seleccionados.")
+
+        report_col1, report_col2 = st.columns(2)
+        with report_col1:
+            one_pager = create_one_pager_excel(result, final_weights_df, profile)
+            st.download_button(
+                "Descargar one pager: Informe de cartera",
+                data=one_pager,
+                file_name="informe_de_cartera.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        with report_col2:
+            try:
+                student_report_row = pd.Series({
+                    "name": user_info.get("name", username),
+                    "internal_id": user_info.get("internal_id", ""),
+                    "profile": profile,
+                    "timestamp": datetime.now().strftime("%d/%m/%Y %H:%M"),
+                })
+                pdf_bytes = create_portfolio_pdf_report(student_report_row, final_weights_df, result)
+                st.download_button(
+                    "Descargar informe de cartera en PDF",
+                    data=pdf_bytes,
+                    file_name="informe_de_cartera.pdf",
+                    mime="application/pdf",
+                )
+            except ModuleNotFoundError:
+                st.warning("Para generar informes PDF instala ReportLab: python3 -m pip install reportlab")
+            except Exception as e:
+                st.warning(f"No se ha podido generar el PDF: {e}")
 
         col_save, col_note = st.columns([1, 3])
         with col_save:
@@ -1942,6 +2082,22 @@ def teacher_page(username: str, user_info: dict):
     ]
     cols_to_show = [c for c in cols_to_show if c in portfolio_display.columns]
     st.dataframe(portfolio_display[cols_to_show], use_container_width=True, hide_index=True)
+
+    if not navs_for_teacher.empty:
+        try:
+            weights_for_metrics = dict(zip(portfolio_detail["Identificador"], portfolio_detail["Peso final"]))
+            result_for_metrics = calculate_backtest(navs_for_teacher, weights_for_metrics)
+            fund_metrics_teacher = prepare_fund_metrics_table(result_for_metrics, portfolio_detail)
+            if not fund_metrics_teacher.empty:
+                st.markdown("**Comportamiento de los fondos en el periodo analizado**")
+                st.caption("Rentabilidad acumulada, rentabilidad anualizada y volatilidad anualizada de cada fondo. Fechas reales omitidas.")
+                st.dataframe(
+                    format_fund_metrics_for_display(fund_metrics_teacher),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        except Exception as e:
+            st.info(f"No se han podido calcular las métricas individuales de fondos: {e}")
 
     # Resumen por grandes bloques y categorías.
     st.markdown("**Resumen por bloques y categorías**")
