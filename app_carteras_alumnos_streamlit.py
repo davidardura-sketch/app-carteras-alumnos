@@ -1,5 +1,5 @@
 # ============================================================
-# APP CARTERAS ALUMNOS - VERSIÓN 1.6
+# APP CARTERAS ALUMNOS - VERSIÓN 1.0 SUPABASE
 # Streamlit
 # ============================================================
 # Objetivo:
@@ -14,7 +14,7 @@
 # - Ocultar fechas reales al alumno. El eje temporal se muestra por años: 1, 2, 3, 4, 5...
 #
 # Ejecución local:
-#   pip install streamlit pandas numpy plotly openpyxl xlsxwriter reportlab
+#   pip install streamlit pandas numpy plotly openpyxl xlsxwriter reportlab supabase
 #   streamlit run app_carteras_alumnos_streamlit.py
 #
 # El Excel debe estar en la misma carpeta que esta app, con nombre:
@@ -24,6 +24,7 @@
 import io
 import json
 import hashlib
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -32,12 +33,18 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+try:
+    from supabase import create_client, Client
+except ModuleNotFoundError:
+    create_client = None
+    Client = None
+
 
 # ------------------------------------------------------------
 # Configuración general
 # ------------------------------------------------------------
 st.set_page_config(
-    page_title="Constructor de Carteras - v1.6",
+    page_title="Constructor de Carteras - v1.0 Supabase",
     page_icon="📊",
     layout="wide",
 )
@@ -95,61 +102,127 @@ st.markdown(
 
 
 # ------------------------------------------------------------
-# Usuarios y administración local/online-ready
+# Usuarios, perfiles y entregas en Supabase
 # ------------------------------------------------------------
+# Esta versión sustituye los JSON/CSV locales por tablas Supabase.
+# La app sigue ejecutándose en Streamlit Cloud; Supabase solo almacena datos vivos.
+
+
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 
 DEFAULT_USERS = {
-    "alumno1": {
-        "password": hash_password("alumno1"),
-        "role": "alumno",
-        "name": "Alumno 1",
-        "internal_id": "A001",
-        "active": True,
-    },
-    "alumno2": {
-        "password": hash_password("alumno2"),
-        "role": "alumno",
-        "name": "Alumno 2",
-        "internal_id": "A002",
-        "active": True,
-    },
     "profesor": {
         "password": hash_password("profesor"),
         "role": "profesor",
         "name": "Profesor",
         "internal_id": "ADMIN",
         "active": True,
-    },
+    }
 }
 
 
-def load_users() -> dict:
-    """Carga usuarios desde JSON. Si no existe, crea una base inicial.
+def get_supabase_credentials() -> tuple[str | None, str | None]:
+    """Lee credenciales desde Streamlit Secrets.
 
-    Esta solución mantiene la app simple para la v1.6 y prepara la transición
-    a una base externa tipo Supabase/PostgreSQL para la versión online.
+    Formato recomendado en Streamlit Cloud / .streamlit/secrets.toml:
+
+    [supabase]
+    url = "https://xxxxxxxx.supabase.co"
+    service_role_key = "eyJ..."
+
+    También acepta claves raíz SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY.
     """
-    if USERS_FILE.exists():
-        try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                users = json.load(f)
-            # Migración suave por si algún usuario antiguo no tiene campo active.
-            for data in users.values():
-                data.setdefault("active", True)
-            return users
-        except Exception:
-            return DEFAULT_USERS.copy()
+    url = None
+    key = None
+    try:
+        if "supabase" in st.secrets:
+            url = st.secrets["supabase"].get("url")
+            key = st.secrets["supabase"].get("service_role_key") or st.secrets["supabase"].get("key")
+        url = url or st.secrets.get("SUPABASE_URL")
+        key = key or st.secrets.get("SUPABASE_SERVICE_ROLE_KEY") or st.secrets.get("SUPABASE_KEY")
+    except Exception:
+        pass
+    return url, key
 
-    save_users(DEFAULT_USERS.copy())
-    return DEFAULT_USERS.copy()
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
+    if create_client is None:
+        st.error("Falta instalar la librería supabase. Añade 'supabase' a requirements.txt.")
+        st.stop()
+
+    url, key = get_supabase_credentials()
+    if not url or not key:
+        st.error(
+            "Faltan las credenciales de Supabase. Configura SUPABASE_URL y "
+            "SUPABASE_SERVICE_ROLE_KEY en los Secrets de Streamlit Cloud."
+        )
+        st.stop()
+
+    return create_client(url, key)
+
+
+def safe_execute(query):
+    """Ejecuta una consulta Supabase con mensaje legible si falla."""
+    try:
+        return query.execute()
+    except Exception as e:
+        st.error(f"Error de conexión/consulta con Supabase: {e}")
+        st.stop()
+
+
+def bootstrap_admin_if_empty() -> None:
+    """Crea un profesor inicial si la tabla app_users está vacía.
+
+    Después de entrar por primera vez, cambia esta contraseña desde el panel de profesor.
+    """
+    client = get_supabase_client()
+    res = safe_execute(client.table("app_users").select("username").limit(1))
+    if not getattr(res, "data", None):
+        admin = {
+            "username": "profesor",
+            "password_hash": hash_password("profesor"),
+            "role": "profesor",
+            "name": "Profesor",
+            "internal_id": "ADMIN",
+            "active": True,
+        }
+        safe_execute(client.table("app_users").insert(admin))
+
+
+def load_users() -> dict:
+    bootstrap_admin_if_empty()
+    client = get_supabase_client()
+    res = safe_execute(client.table("app_users").select("*"))
+    users = {}
+    for row in res.data or []:
+        users[row["username"]] = {
+            "password": row.get("password_hash", ""),
+            "role": row.get("role", "alumno"),
+            "name": row.get("name") or row.get("username"),
+            "internal_id": row.get("internal_id") or row.get("username"),
+            "active": bool(row.get("active", True)),
+        }
+    return users
 
 
 def save_users(users: dict) -> None:
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
+    """Compatibilidad. En Supabase los cambios se hacen con funciones específicas."""
+    client = get_supabase_client()
+    rows = []
+    for username, data in users.items():
+        rows.append({
+            "username": username,
+            "password_hash": data.get("password", ""),
+            "role": data.get("role", "alumno"),
+            "name": data.get("name", username),
+            "internal_id": data.get("internal_id", username),
+            "active": bool(data.get("active", True)),
+        })
+    if rows:
+        safe_execute(client.table("app_users").upsert(rows, on_conflict="username"))
 
 
 def create_user(username: str, password: str, name: str, internal_id: str, role: str = "alumno") -> tuple[bool, str]:
@@ -163,39 +236,38 @@ def create_user(username: str, password: str, name: str, internal_id: str, role:
     if username in users:
         return False, "Ese usuario ya existe."
 
-    users[username] = {
-        "password": hash_password(password),
+    client = get_supabase_client()
+    row = {
+        "username": username,
+        "password_hash": hash_password(password),
         "role": role,
         "name": name.strip() or username,
         "internal_id": internal_id.strip() or username,
         "active": True,
     }
-    save_users(users)
+    safe_execute(client.table("app_users").insert(row))
     return True, "Usuario creado correctamente."
 
 
 def update_user_password(username: str, new_password: str) -> tuple[bool, str]:
-    users = load_users()
-    if username not in users:
-        return False, "Usuario no encontrado."
     if not new_password:
         return False, "La nueva contraseña no puede estar vacía."
-    users[username]["password"] = hash_password(new_password)
-    save_users(users)
+    client = get_supabase_client()
+    safe_execute(
+        client.table("app_users")
+        .update({"password_hash": hash_password(new_password)})
+        .eq("username", username)
+    )
     return True, "Contraseña actualizada."
 
 
 def set_user_active(username: str, active: bool) -> tuple[bool, str]:
-    users = load_users()
-    if username not in users:
-        return False, "Usuario no encontrado."
-    users[username]["active"] = bool(active)
-    save_users(users)
+    client = get_supabase_client()
+    safe_execute(client.table("app_users").update({"active": bool(active)}).eq("username", username))
     return True, "Estado actualizado."
 
 
 def delete_user_completely(username: str) -> tuple[bool, str]:
-    """Elimina usuario y su perfil de riesgo. No borra entregas ya guardadas."""
     users = load_users()
     if username not in users:
         return False, "Usuario no encontrado."
@@ -203,13 +275,10 @@ def delete_user_completely(username: str) -> tuple[bool, str]:
         num_profesores = sum(1 for u in users.values() if u.get("role") == "profesor")
         if num_profesores <= 1:
             return False, "No se puede borrar el último usuario profesor."
-    del users[username]
-    save_users(users)
 
-    profiles = load_user_profiles() if "load_user_profiles" in globals() else {}
-    if username in profiles:
-        del profiles[username]
-        save_user_profiles(profiles)
+    client = get_supabase_client()
+    safe_execute(client.table("risk_profiles").delete().eq("username", username))
+    safe_execute(client.table("app_users").delete().eq("username", username))
     return True, "Usuario eliminado. Las entregas históricas se conservan."
 
 
@@ -352,35 +421,63 @@ def profile_from_score(score: int) -> str:
 
 
 def load_user_profiles() -> dict:
-    if PROFILE_FILE.exists():
-        try:
-            with open(PROFILE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    client = get_supabase_client()
+    res = safe_execute(client.table("risk_profiles").select("*"))
+    profiles = {}
+    for row in res.data or []:
+        profiles[row["username"]] = {
+            "profile": row.get("profile"),
+            "score": row.get("score"),
+            "timestamp": row.get("timestamp"),
+            "answers": row.get("answers") or {},
+        }
+    return profiles
 
 
 def save_user_profiles(profiles: dict) -> None:
-    with open(PROFILE_FILE, "w", encoding="utf-8") as f:
-        json.dump(profiles, f, ensure_ascii=False, indent=2)
+    client = get_supabase_client()
+    rows = []
+    for username, data in profiles.items():
+        rows.append({
+            "username": username,
+            "profile": data.get("profile"),
+            "score": int(data.get("score", 0)) if data.get("score") not in [None, ""] else None,
+            "answers": data.get("answers") or {},
+            "timestamp": data.get("timestamp") or datetime.now().isoformat(timespec="seconds"),
+        })
+    if rows:
+        safe_execute(client.table("risk_profiles").upsert(rows, on_conflict="username"))
 
 
 def get_user_risk_profile(username: str) -> dict | None:
-    return load_user_profiles().get(username)
+    client = get_supabase_client()
+    res = safe_execute(client.table("risk_profiles").select("*").eq("username", username).limit(1))
+    if not res.data:
+        return None
+    row = res.data[0]
+    return {
+        "profile": row.get("profile"),
+        "score": row.get("score"),
+        "timestamp": row.get("timestamp"),
+        "answers": row.get("answers") or {},
+    }
 
 
 def save_user_risk_profile(username: str, profile_data: dict) -> None:
-    profiles = load_user_profiles()
-    profiles[username] = profile_data
-    save_user_profiles(profiles)
+    client = get_supabase_client()
+    row = {
+        "username": username,
+        "profile": profile_data.get("profile"),
+        "score": int(profile_data.get("score", 0)),
+        "answers": profile_data.get("answers") or {},
+        "timestamp": profile_data.get("timestamp") or datetime.now().isoformat(timespec="seconds"),
+    }
+    safe_execute(client.table("risk_profiles").upsert(row, on_conflict="username"))
 
 
 def delete_user_risk_profile(username: str) -> None:
-    profiles = load_user_profiles()
-    if username in profiles:
-        del profiles[username]
-        save_user_profiles(profiles)
+    client = get_supabase_client()
+    safe_execute(client.table("risk_profiles").delete().eq("username", username))
 
 
 # ------------------------------------------------------------
@@ -939,6 +1036,8 @@ def create_portfolio_pdf_report(selected_row: pd.Series, portfolio_detail: pd.Da
 # Guardado de entregas
 # ------------------------------------------------------------
 def save_submission(username: str, user_info: dict, profile: str, final_weights_df: pd.DataFrame, result: dict):
+    client = get_supabase_client()
+    submission_id = str(uuid.uuid4())
     portfolio_records = final_weights_df.copy()
     portfolio_records["Peso final"] = pd.to_numeric(portfolio_records["Peso final"], errors="coerce").fillna(0.0)
     portfolio_json = portfolio_records.to_dict(orient="records")
@@ -947,34 +1046,74 @@ def save_submission(username: str, user_info: dict, profile: str, final_weights_
         for _, r in portfolio_records.sort_values("Peso final", ascending=False).iterrows()
     )
 
-    row = {
+    submission_row = {
+        "id": submission_id,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "username": username,
         "internal_id": user_info["internal_id"],
         "name": user_info["name"],
         "profile": profile,
-        "initial_nav": INITIAL_NAV,
-        "total_return": result["total_return"],
-        "annual_return": result["annual_return"],
-        "annual_volatility": result["annual_volatility"],
-        "sharpe": result["sharpe"],
-        "max_drawdown": result["max_drawdown"],
+        "initial_nav": float(INITIAL_NAV),
+        "total_return": float(result["total_return"]),
+        "annual_return": float(result["annual_return"]),
+        "annual_volatility": float(result["annual_volatility"]),
+        "sharpe": float(result["sharpe"]),
+        "max_drawdown": float(result["max_drawdown"]),
         "num_fondos": int(len(portfolio_records)),
         "portfolio_summary": portfolio_summary,
-        "portfolio_json": json.dumps(portfolio_json, ensure_ascii=False),
     }
 
-    # Mantiene también columnas individuales por fondo para poder explotar el CSV en Excel.
+    position_rows = []
     for _, r in portfolio_records.iterrows():
-        row[f"peso_{r['Identificador']}"] = r["Peso final"]
+        position_rows.append({
+            "submission_id": submission_id,
+            "identifier": str(r.get("Identificador", "")),
+            "fund_name": str(r.get("Nombre", "")),
+            "block": str(r.get("Bloque", "")),
+            "category": str(r.get("Categoría", "")),
+            "subcategory": str(r.get("Subcategoría", "")),
+            "internal_weight": float(r.get("Peso interno", 0) or 0),
+            "final_weight": float(r.get("Peso final", 0) or 0),
+        })
 
-    new_row = pd.DataFrame([row])
-    if SUBMISSIONS_FILE.exists():
-        existing = pd.read_csv(SUBMISSIONS_FILE)
-        output = pd.concat([existing, new_row], ignore_index=True)
-    else:
-        output = new_row
-    output.to_csv(SUBMISSIONS_FILE, index=False)
+    safe_execute(client.table("submissions").insert(submission_row))
+    if position_rows:
+        safe_execute(client.table("submission_positions").insert(position_rows))
+
+
+def load_submissions() -> pd.DataFrame:
+    """Carga entregas desde Supabase y reconstruye portfolio_json para reutilizar la vista profesor."""
+    client = get_supabase_client()
+    subs_res = safe_execute(client.table("submissions").select("*").order("timestamp", desc=True))
+    submissions = subs_res.data or []
+    if not submissions:
+        return pd.DataFrame()
+
+    ids = [row["id"] for row in submissions if row.get("id")]
+    positions_by_submission = {sid: [] for sid in ids}
+    if ids:
+        pos_res = safe_execute(client.table("submission_positions").select("*").in_("submission_id", ids))
+        for pos in pos_res.data or []:
+            record = {
+                "Identificador": pos.get("identifier"),
+                "Nombre": pos.get("fund_name"),
+                "Bloque": pos.get("block"),
+                "Categoría": pos.get("category"),
+                "Subcategoría": pos.get("subcategory"),
+                "Peso interno": pos.get("internal_weight"),
+                "Peso final": pos.get("final_weight"),
+            }
+            positions_by_submission.setdefault(pos.get("submission_id"), []).append(record)
+
+    rows = []
+    for row in submissions:
+        out = dict(row)
+        records = positions_by_submission.get(row.get("id"), [])
+        out["portfolio_json"] = json.dumps(records, ensure_ascii=False)
+        for rec in records:
+            out[f"peso_{rec.get('Identificador')}"] = rec.get("Peso final")
+        rows.append(out)
+    return pd.DataFrame(rows)
 
 
 def portfolio_from_submission_row(row: pd.Series, classification: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -1675,11 +1814,10 @@ def teacher_page(username: str, user_info: dict):
     else:
         st.info("Todavía no hay perfiles de riesgo guardados.")
 
-    if not SUBMISSIONS_FILE.exists():
+    submissions = load_submissions()
+    if submissions.empty:
         st.info("Todavía no hay carteras guardadas por alumnos.")
         return
-
-    submissions = pd.read_csv(SUBMISSIONS_FILE)
 
     # Intenta cargar clasificación e histórico para enriquecer carteras antiguas y generar informes PDF.
     classification = pd.DataFrame()
