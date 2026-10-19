@@ -1188,6 +1188,40 @@ def save_submission(username: str, user_info: dict, profile: str, final_weights_
         safe_execute(client.table("submission_positions").insert(position_rows))
 
 
+def clear_submissions() -> int:
+    """Borra las entregas existentes al iniciar la limpieza, solo para profesores."""
+    current_user = st.session_state.get("username")
+    current_meta = load_users().get(current_user, {})
+    if (not st.session_state.get("authenticated")
+            or current_meta.get("role") != "profesor"
+            or not current_meta.get("active", True)):
+        raise PermissionError("Solo un profesor activo puede limpiar las entregas.")
+
+    client = get_supabase_client()
+    # Captura todos los IDs antes de borrar: no depende del límite de 1.000 filas
+    # ni incluye nuevas entregas que lleguen después de capturar la lista.
+    submission_ids = []
+    offset = 0
+    page_size = 200
+    while True:
+        response = safe_execute(
+            client.table("submissions").select("id").order("id")
+            .range(offset, offset + page_size - 1)
+        )
+        rows = response.data or []
+        submission_ids.extend(row["id"] for row in rows)
+        if len(rows) < page_size:
+            break
+        offset += page_size
+
+    for start in range(0, len(submission_ids), page_size):
+        batch = submission_ids[start:start + page_size]
+        # Borra primero el detalle para respetar la relación con la entrega.
+        safe_execute(client.table("submission_positions").delete().in_("submission_id", batch))
+        safe_execute(client.table("submissions").delete().in_("id", batch))
+    return len(submission_ids)
+
+
 def load_submissions() -> pd.DataFrame:
     """Carga entregas desde Supabase y reconstruye portfolio_json para reutilizar la vista profesor."""
     client = get_supabase_client()
@@ -1954,7 +1988,34 @@ def teacher_page(username: str, user_info: dict):
     else:
         st.info("Todavía no hay perfiles de riesgo guardados.")
 
+    cleanup_message = st.session_state.pop("submissions_cleanup_message", None)
+    if cleanup_message:
+        st.success(cleanup_message)
+
     submissions = load_submissions()
+    with st.expander("Limpiar entregas para una nueva clase", expanded=False):
+        st.write(
+            "Elimina de forma permanente todas las entregas guardadas y sus posiciones de cartera. "
+            "Los usuarios y los tests de perfil de riesgo se conservan."
+        )
+        st.caption("Antes de limpiar, puedes descargar las entregas en CSV desde el resumen inferior.")
+        with st.form("clear_submissions_form", clear_on_submit=True):
+            confirm_cleanup = st.checkbox("Confirmo que quiero borrar todas las entregas anteriores")
+            cleanup_requested = st.form_submit_button(
+                "Limpiar entregas", disabled=submissions.empty
+            )
+        if cleanup_requested:
+            if not confirm_cleanup:
+                st.error("Marca la confirmación antes de limpiar las entregas.")
+            else:
+                with st.spinner("Limpiando entregas…"):
+                    deleted_count = clear_submissions()
+                st.session_state["submissions_cleanup_message"] = (
+                    f"Limpieza completada: {deleted_count} entregas eliminadas. "
+                    "Ya puedes empezar con la nueva clase."
+                )
+                st.rerun()
+
     if submissions.empty:
         st.info("Todavía no hay carteras guardadas por alumnos.")
         return
